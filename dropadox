@@ -1,0 +1,553 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+BASE_URL="${DROPADOX_BASE_URL:-https://dropadox.sytes.net}"
+API_URL="${BASE_URL%/}/api/v1"
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Dropadox CLI
+
+Usage:
+  dropadox storage
+  dropadox folders
+  dropadox files [--folder ID]
+  dropadox mkdir NAME [--parent ID]
+  dropadox upload FILE [--folder ID]
+  dropadox download FILE_ID [OUTPUT_FILE]
+  dropadox delete FILE_ID
+  dropadox find SEARCH_TEXT
+  dropadox help
+
+Examples:
+  dropadox storage
+  dropadox folders
+  dropadox mkdir "Terminal Uploads"
+  dropadox mkdir "Backups" --parent 101
+  dropadox upload backup.zip
+  dropadox upload backup.zip --folder 101
+  dropadox files
+  dropadox files --folder 101
+  dropadox find backup
+  dropadox download 234 backup.zip
+  dropadox delete 234
+
+Environment:
+  DROPADOX_API_KEY    Required API key
+  DROPADOX_BASE_URL   Optional API base URL
+EOF
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 ||
+        die "Required command not found: $1"
+}
+
+check_environment() {
+    require_command curl
+    require_command jq
+
+    [[ -n "${DROPADOX_API_KEY:-}" ]] ||
+        die 'DROPADOX_API_KEY is not set'
+}
+
+pretty_table() {
+    if command -v column >/dev/null 2>&1; then
+        column -t -s $'\t'
+    else
+        cat
+    fi
+}
+
+api_request() {
+    local method="$1"
+    local url="$2"
+    shift 2
+
+    curl \
+        --fail-with-body \
+        --silent \
+        --show-error \
+        --request "$method" \
+        "$url" \
+        --header "Authorization: Bearer ${DROPADOX_API_KEY}" \
+        "$@"
+}
+
+normalize_folders() {
+    jq -c '
+        if type == "array" then
+            .
+        elif (.folders? | type) == "array" then
+            .folders
+        elif (.data? | type) == "array" then
+            .data
+        else
+            []
+        end
+    '
+}
+
+normalize_files() {
+    jq -c '
+        if type == "array" then
+            .
+        elif (.files? | type) == "array" then
+            .files
+        elif (.data? | type) == "array" then
+            .data
+        else
+            []
+        end
+    '
+}
+
+folder_path() {
+    local folders="$1"
+    local folder_id="$2"
+
+    jq -r --arg id "$folder_id" '
+        . as $folders
+        | (
+            $folders
+            | map({
+                key: (.id | tostring),
+                value: .
+            })
+            | from_entries
+        ) as $byId
+
+        | def path($id):
+            ($byId[($id | tostring)]) as $folder
+            | if $folder == null then
+                ""
+              elif ($folder.parentId // null) == null then
+                $folder.name
+              else
+                path($folder.parentId) + "/" + $folder.name
+              end;
+
+        path($id)
+    ' <<<"$folders"
+}
+
+cmd_storage() {
+    api_request GET "${API_URL}/storage" | jq .
+}
+
+cmd_folders() {
+    local response
+    local folders
+    local count
+
+    response="$(api_request GET "${API_URL}/folders")"
+    folders="$(normalize_folders <<<"$response")"
+    count="$(jq 'length' <<<"$folders")"
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "No folders found."
+        return
+    fi
+
+    jq -r '
+        . as $folders
+        | (
+            $folders
+            | map({
+                key: (.id | tostring),
+                value: .
+            })
+            | from_entries
+        ) as $byId
+
+        | def path($id):
+            ($byId[($id | tostring)]) as $folder
+            | if $folder == null then
+                ""
+              elif ($folder.parentId // null) == null then
+                $folder.name
+              else
+                path($folder.parentId) + "/" + $folder.name
+              end;
+
+        (
+            ["ID", "PARENT", "PATH"] | @tsv
+        ),
+        (
+            $folders[]
+            | [
+                (.id | tostring),
+                ((.parentId // "-") | tostring),
+                ("/" + path(.id))
+            ]
+            | @tsv
+        )
+    ' <<<"$folders" | pretty_table
+}
+
+cmd_files() {
+    local folder_id=""
+    local url
+    local response
+    local files
+    local count
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --folder|-f)
+                [[ $# -ge 2 ]] || die "--folder requires an ID"
+                folder_id="$2"
+                shift 2
+                ;;
+            *)
+                die "Unknown files option: $1"
+                ;;
+        esac
+    done
+
+    url="${API_URL}/files"
+
+    if [[ -n "$folder_id" ]]; then
+        url="${url}?folderId=${folder_id}"
+    fi
+
+    response="$(api_request GET "$url")"
+    files="$(normalize_files <<<"$response")"
+    count="$(jq 'length' <<<"$files")"
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "No files found."
+        return
+    fi
+
+    jq -r '
+        (
+            ["ID", "NAME", "SIZE", "CREATED"] | @tsv
+        ),
+        (
+            .[]
+            | [
+                (.id | tostring),
+                (
+                    .name
+                    // .filename
+                    // .originalName
+                    // "Unknown"
+                ),
+                (
+                    .sizeBytes
+                    // .size
+                    // .bytes
+                    // "-"
+                    | tostring
+                ),
+                (
+                    .createdAt
+                    // .created_at
+                    // "-"
+                )
+            ]
+            | @tsv
+        )
+    ' <<<"$files" | pretty_table
+}
+
+cmd_mkdir() {
+    [[ $# -ge 1 ]] || die "Folder name is required"
+
+    local name="$1"
+    local parent_id=""
+    local payload
+
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --parent|-p)
+                [[ $# -ge 2 ]] || die "--parent requires an ID"
+                parent_id="$2"
+                shift 2
+                ;;
+            *)
+                die "Unknown mkdir option: $1"
+                ;;
+        esac
+    done
+
+    if [[ -n "$parent_id" ]]; then
+        [[ "$parent_id" =~ ^[0-9]+$ ]] ||
+            die "Parent ID must be numeric"
+
+        payload="$(
+            jq -nc \
+                --arg name "$name" \
+                --argjson parentId "$parent_id" \
+                '{name: $name, parentId: $parentId}'
+        )"
+    else
+        payload="$(
+            jq -nc \
+                --arg name "$name" \
+                '{name: $name}'
+        )"
+    fi
+
+    api_request POST "${API_URL}/folders" \
+        --header "Content-Type: application/json" \
+        --data "$payload" |
+        jq .
+}
+
+cmd_upload() {
+    [[ $# -ge 1 ]] || die "File path is required"
+
+    local file="$1"
+    local folder_id=""
+    local curl_args=()
+
+    shift
+
+    [[ -f "$file" ]] || die "File not found: $file"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --folder|-f)
+                [[ $# -ge 2 ]] || die "--folder requires an ID"
+                folder_id="$2"
+                shift 2
+                ;;
+            *)
+                die "Unknown upload option: $1"
+                ;;
+        esac
+    done
+
+    curl_args+=(--form "file=@${file}")
+
+    if [[ -n "$folder_id" ]]; then
+        curl_args+=(--form "folderId=${folder_id}")
+    fi
+
+    api_request POST "${API_URL}/files" "${curl_args[@]}" | jq .
+}
+
+cmd_download() {
+    [[ $# -ge 1 ]] || die "File ID is required"
+
+    local file_id="$1"
+    local output="${2:-}"
+
+    if [[ -n "$output" ]]; then
+        curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --location \
+            "${API_URL}/files/${file_id}" \
+            --header "Authorization: Bearer ${DROPADOX_API_KEY}" \
+            --output "$output"
+
+        echo "Downloaded to: $output"
+    else
+        curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --location \
+            --remote-name \
+            --remote-header-name \
+            "${API_URL}/files/${file_id}" \
+            --header "Authorization: Bearer ${DROPADOX_API_KEY}"
+
+        echo "Download complete."
+    fi
+}
+
+cmd_delete() {
+    [[ $# -ge 1 ]] || die "File ID is required"
+
+    local file_id="$1"
+    local response
+
+    response="$(api_request DELETE "${API_URL}/files/${file_id}")"
+
+    if [[ -n "$response" ]]; then
+        jq . <<<"$response"
+    else
+        echo "Deleted file ID: $file_id"
+    fi
+}
+
+cmd_find() {
+    [[ $# -ge 1 ]] || die "Search text is required"
+
+    local query="$*"
+    local folder_response
+    local folders
+    local results_file
+
+    folder_response="$(api_request GET "${API_URL}/folders")"
+    folders="$(normalize_folders <<<"$folder_response")"
+    results_file="$(mktemp)"
+
+    trap 'rm -f "$results_file"' RETURN
+
+    # Search folder names and full folder paths.
+    jq -c --arg query "$query" '
+        . as $folders
+        | (
+            $folders
+            | map({
+                key: (.id | tostring),
+                value: .
+            })
+            | from_entries
+        ) as $byId
+
+        | def path($id):
+            ($byId[($id | tostring)]) as $folder
+            | if $folder == null then
+                ""
+              elif ($folder.parentId // null) == null then
+                $folder.name
+              else
+                path($folder.parentId) + "/" + $folder.name
+              end;
+
+        $folders[]
+        | {
+            type: "folder",
+            id: .id,
+            path: ("/" + path(.id)),
+            size: null
+        }
+        | select(
+            (.path | ascii_downcase)
+            | contains($query | ascii_downcase)
+        )
+    ' <<<"$folders" >>"$results_file"
+
+    # Search root files first, followed by every folder.
+    {
+        echo "ROOT"
+        jq -r '.[].id' <<<"$folders"
+    } | while IFS= read -r location; do
+        local url
+        local prefix
+        local response
+        local files
+
+        if [[ "$location" == "ROOT" ]]; then
+            url="${API_URL}/files"
+            prefix=""
+        else
+            url="${API_URL}/files?folderId=${location}"
+            prefix="/$(folder_path "$folders" "$location")"
+        fi
+
+        response="$(api_request GET "$url")"
+        files="$(normalize_files <<<"$response")"
+
+        jq -c \
+            --arg query "$query" \
+            --arg prefix "$prefix" '
+            .[]
+            | (
+                .name
+                // .filename
+                // .originalName
+                // ("file-" + (.id | tostring))
+            ) as $name
+
+            | {
+                type: "file",
+                id: .id,
+                path: ($prefix + "/" + $name),
+                size: (
+                    .sizeBytes
+                    // .size
+                    // .bytes
+                    // null
+                )
+            }
+
+            | select(
+                (.path | ascii_downcase)
+                | contains($query | ascii_downcase)
+            )
+        ' <<<"$files" >>"$results_file"
+    done
+
+    if [[ ! -s "$results_file" ]]; then
+        echo "No files or folders matched: $query"
+        return
+    fi
+
+    jq -sr '
+        (
+            ["TYPE", "ID", "PATH", "SIZE"] | @tsv
+        ),
+        (
+            sort_by(.path)[]
+            | [
+                .type,
+                (.id | tostring),
+                .path,
+                ((.size // "-") | tostring)
+            ]
+            | @tsv
+        )
+    ' "$results_file" | pretty_table
+}
+
+main() {
+    check_environment
+
+    local command="${1:-help}"
+
+    if [[ $# -gt 0 ]]; then
+        shift
+    fi
+
+    case "$command" in
+        storage)
+            cmd_storage "$@"
+            ;;
+        folders)
+            cmd_folders "$@"
+            ;;
+        files|ls)
+            cmd_files "$@"
+            ;;
+        mkdir)
+            cmd_mkdir "$@"
+            ;;
+        upload|put)
+            cmd_upload "$@"
+            ;;
+        download|get)
+            cmd_download "$@"
+            ;;
+        delete|rm)
+            cmd_delete "$@"
+            ;;
+        find|search)
+            cmd_find "$@"
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        *)
+            usage >&2
+            die "Unknown command: $command"
+            ;;
+    esac
+}
+
+main "$@"
